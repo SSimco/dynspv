@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+
+#pragma once
+
+#include <algorithm>
+#include <concepts>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <spirv/unified1/spirv.hpp>
+
+namespace dynspv
+{
+	template<typename T>
+	concept spvConstant = (std::integral<T> || std::floating_point<T>);
+
+	#generated_spv_id_types
+
+	inline void countOperandsWord(uint16_t& wordCount)
+	{
+	}
+
+	inline void countOperandWord(uint16_t& wordCount, spvConstant auto operand)
+	{
+		wordCount += ((sizeof(decltype(operand)) + 3) & ~0x3) / sizeof(uint32_t);
+	}
+
+	inline void countOperandWord(uint16_t& wordCount, const std::string& operand)
+	{
+		wordCount += operand.size() / sizeof(uint32_t) + 1;
+	}
+
+	inline void countOperandWord(uint16_t& wordCount, uint32_t operand)
+	{
+		wordCount++;
+	}
+
+	template<typename... TArgs>
+	inline void countOperandWord(uint16_t& wordCount, const std::tuple<TArgs...>& operand)
+	{
+		std::apply([&wordCount](auto&... args) { (countOperandWord(wordCount, args), ...); }, operand);
+	}
+
+	template<typename T>
+	inline void countOperandWord(uint16_t& wordCount, std::optional<T>& operand)
+	{
+		if (operand.has_value())
+		{
+			countOperandWord(wordCount, operand.value());
+		}
+	}
+
+	template<typename T>
+	inline void countOperandWord(uint16_t& wordCount, const std::vector<T>& operand)
+	{
+		for (auto&& el : operand)
+		{
+			countOperandWord(wordCount, el);
+		}
+	}
+
+	template<typename T, typename... TArgs>
+	inline void countOperandsWord(uint16_t& wordCount, T operand, TArgs... args)
+	{
+		countOperandWord(wordCount, operand);
+		countOperandsWord(wordCount, std::forward<TArgs>(args)...);
+	}
+
+	constexpr size_t DEFAULT_MAX_CODE_SIZE = 1024;
+	constexpr size_t BOUND_INDEX = 3;
+
+	class ModuleGenerator
+	{
+	  protected:
+		std::vector<uint32_t> m_code{DEFAULT_MAX_CODE_SIZE};
+		size_t m_size{0};
+
+		void growMemory()
+		{
+			m_code.resize(std::max(DEFAULT_MAX_CODE_SIZE, m_code.size() * 2));
+		}
+
+		uint32_t m_id = 1;
+
+		uint32_t nextId()
+		{
+			return m_id++;
+		}
+
+	  public:
+		uint32_t getBound() const
+		{
+			return m_id;
+		}
+
+		const std::vector<uint32_t>& getCode()
+		{
+			if (m_code.size() != m_size)
+			{
+				m_code.resize(m_size);
+			}
+
+			return m_code;
+		}
+
+		inline void writeWord(uint32_t val)
+		{
+			if (m_size >= m_code.size())
+			{
+				growMemory();
+			}
+
+			m_code[m_size++] = val;
+		}
+
+		inline void writeWord(uint16_t low, uint16_t high)
+		{
+			uint32_t word = (static_cast<uint32_t>(high) << 16) | static_cast<uint32_t>(low);
+			writeWord(word);
+		}
+
+		inline void writeWord(spvConstant auto val)
+		{
+			using T = decltype(val);
+			constexpr size_t words_count = ((sizeof(T) + 3) & ~0x3) / sizeof(uint32_t);
+			union
+			{
+				T v;
+				uint32_t u32[words_count];
+			} vals = {val};
+
+			if constexpr (!std::is_floating_point_v<T> && std::is_signed_v<T> && sizeof(T) < sizeof(uint32_t))
+			{
+				vals.u32[0] = (uint32_t)(int32_t)(T)vals.u32[0];
+			}
+
+			for (size_t i = 0; i < words_count; i++)
+			{
+				writeWord(vals.u32[i]);
+			}
+		}
+
+		inline void writeWord(const std::string& string)
+		{
+			const uint32_t* vals = reinterpret_cast<const uint32_t*>(string.data());
+			const size_t size = string.size() / sizeof(uint32_t);
+			size_t bytesWritten = 0;
+
+			for (size_t i = 0; i < size; i++)
+			{
+				writeWord(vals[i]);
+				bytesWritten += 4;
+			}
+
+			if (bytesWritten == string.size())
+			{
+				writeWord(0);
+				return;
+			}
+
+			uint32_t lastVal = 0;
+			for (size_t i = bytesWritten; i < string.size(); i++)
+			{
+				lastVal = lastVal << 8 | string[i];
+			}
+
+			writeWord(lastVal);
+		}
+
+		template<typename... TArgs>
+		inline void writeWord(const std::tuple<TArgs...>& val)
+		{
+			std::apply([this](auto&... args) { (writeWord(args), ...); }, val);
+		}
+
+		template<typename T>
+			requires std::is_enum_v<T>
+		inline void writeWord(T val)
+		{
+			writeWord(static_cast<uint32_t>(val));
+		}
+
+		template<typename T>
+		inline void writeWord(const std::vector<T>& values)
+		{
+			for (auto&& val : values)
+			{
+				writeWord(val);
+			}
+		}
+
+		template<typename T>
+		inline void writeWord(std::optional<T> word)
+		{
+			if (word.has_value())
+			{
+				writeWord(word.value());
+			}
+		}
+
+		inline void writeWords()
+		{
+		}
+
+		template<typename T, typename... TArgs>
+		inline void writeWords(T val, TArgs... args)
+		{
+			writeWord(val);
+			writeWords(std::forward<TArgs>(args)...);
+		}
+
+		void writeMagicNumber()
+		{
+			writeWord(spv::MagicNumber);
+		}
+
+		void writeVersionNumber(uint32_t version = spv::Version)
+		{
+			writeWord(version);
+		}
+
+		void writeGeneratorMagicNumber()
+		{
+			writeWord(0);
+		}
+
+		void writeBound(uint32_t bound = 0)
+		{
+			writeWord(bound);
+		}
+
+		void updateBound(uint32_t bound)
+		{
+			size_t oldSize = m_size;
+			m_size = BOUND_INDEX;
+			writeWord(bound);
+			m_size = oldSize;
+		}
+
+		void writeInstructionSchema()
+		{
+			writeWord(0);
+		}
+
+		void writeHeader(uint32_t version = spv::Version)
+		{
+			writeMagicNumber();
+			writeVersionNumber(version);
+			writeGeneratorMagicNumber();
+			writeBound();
+			writeInstructionSchema();
+		}
+
+		#generated_code
+	};
+} // namespace dynspv
